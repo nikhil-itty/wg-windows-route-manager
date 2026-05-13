@@ -81,6 +81,56 @@ function Ask-Gate {
   }
 }
 
+# -- Conflict checks --------------------------------------------------------
+
+function Get-GateConflicts {
+  param([string]$Gate, [int[]]$FwPorts, $Proxies)
+  $warnings   = @()
+  $proxyPorts = @($Proxies | ForEach-Object { [int]$_.ListenPort })
+  foreach ($p in $Proxies) {
+    if ([int]$p.ListenPort -notin $FwPorts) {
+      $warnings += "$Gate : portproxy :$($p.ListenPort) has no matching firewall rule (traffic will be blocked)"
+    }
+  }
+  foreach ($port in $FwPorts) {
+    if ($port -notin $proxyPorts) {
+      $warnings += "$Gate : firewall rule for port $port has no matching portproxy entry (nothing will be listening)"
+    }
+  }
+  return $warnings
+}
+
+function Show-GateConflictWarnings {
+  param([string]$Gate)
+  $group   = $GateGroup[$Gate]
+  $proxies = @($Cfg.PortProxies.$Gate)
+  $rules   = Get-NetFirewallRule -ErrorAction SilentlyContinue | Where-Object { $_.Group -eq $group }
+  $fwPorts = @()
+  foreach ($r in $rules) {
+    $pf = $r | Get-NetFirewallPortFilter -ErrorAction SilentlyContinue
+    if ($pf -and $pf.LocalPort -ne "Any") { $fwPorts += [int]$pf.LocalPort }
+  }
+  $warnings = Get-GateConflicts -Gate $Gate -FwPorts $fwPorts -Proxies $proxies
+
+  # Cross-gate: detect connect-side duplicates (same ConnectAddress:ConnectPort used by another gate)
+  foreach ($p in $proxies) {
+    foreach ($other in @("docker","winapp") | Where-Object { $_ -ne $Gate }) {
+      $clash = @($Cfg.PortProxies.$other) | Where-Object {
+        $_.ConnectAddress -eq $p.ConnectAddress -and [int]$_.ConnectPort -eq [int]$p.ConnectPort
+      }
+      if ($clash) {
+        $warnings += ("$Gate : portproxy :$($p.ListenPort) -> $($p.ConnectAddress):$($p.ConnectPort) " +
+          "clashes with $other :$($clash[0].ListenPort) (both forward to the same local port)")
+      }
+    }
+  }
+
+  if ($warnings.Count -gt 0) {
+    Write-Host "  Conflicts:" -ForegroundColor Yellow
+    foreach ($w in $warnings) { Write-Host "    [!] $w" -ForegroundColor Yellow }
+  }
+}
+
 # -- Status ------------------------------------------------------------------
 
 function Show-Status {
@@ -88,6 +138,8 @@ function Show-Status {
   Write-Host "Route status" -ForegroundColor Cyan
   Write-Host ("{0,-10} {1,-10} {2,-15} {3,-30} {4}" -f "gate", "status", "wg ip", "portproxies", "fw ports")
   Write-Host ("-" * 80)
+
+  $allConflicts = @()
 
   foreach ($g in $Gates) {
     $ip     = Get-GateIp $g
@@ -99,21 +151,43 @@ function Show-Status {
       ($proxies | ForEach-Object { "$($_.ListenPort)->$($_.ConnectPort)" }) -join ", "
     }
 
-    $rules = Get-NetFirewallRule -ErrorAction SilentlyContinue |
-             Where-Object { $_.Group -eq $GateGroup[$g] }
+    $rules   = Get-NetFirewallRule -ErrorAction SilentlyContinue |
+               Where-Object { $_.Group -eq $GateGroup[$g] }
+    $fwPorts = @()
     $portTxt = if (-not $rules) { "-" } else {
       $pts = $rules | ForEach-Object {
         $pf = $_ | Get-NetFirewallPortFilter -ErrorAction SilentlyContinue
-        if ($pf -and $pf.LocalPort -ne "Any") { "$($pf.Protocol):$($pf.LocalPort)" }
+        if ($pf -and $pf.LocalPort -ne "Any") {
+          $fwPorts += [int]$pf.LocalPort
+          "$($pf.Protocol):$($pf.LocalPort)"
+        }
       } | Sort-Object -Unique
       if ($pts) { $pts -join ", " } else { "-" }
     }
 
     Write-Host ("{0,-10} {1,-10} {2,-15} {3,-30} {4}" -f $g, $status, $ip, $proxyTxt, $portTxt)
+    $allConflicts += Get-GateConflicts -Gate $g -FwPorts $fwPorts -Proxies $proxies
+
+    # Cross-gate connect-side conflicts
+    foreach ($p in $proxies) {
+      foreach ($other in $Gates | Where-Object { $_ -ne $g }) {
+        $clash = @($Cfg.PortProxies.$other) | Where-Object {
+          $_.ConnectAddress -eq $p.ConnectAddress -and [int]$_.ConnectPort -eq [int]$p.ConnectPort
+        }
+        if ($clash) {
+          $allConflicts += ("$g : portproxy :$($p.ListenPort) -> $($p.ConnectAddress):$($p.ConnectPort) " +
+            "clashes with $other :$($clash[0].ListenPort) (both forward to the same local port)")
+        }
+      }
+    }
   }
 
   Write-Host ("-" * 80)
   Write-Host "Server : $($Cfg.ServerWgIp)   Config : $ConfigPath"
+  if ($allConflicts.Count -gt 0) {
+    Write-Host ""
+    foreach ($w in $allConflicts) { Write-Host "  [!] $w" -ForegroundColor Yellow }
+  }
   Write-Host ""
 }
 
@@ -233,6 +307,7 @@ function Configure-Ports {
       -RemoteAddress $Cfg.ServerWgIp `
       -LocalPort $port -Enabled False | Out-Null
     Write-Host "Added: $name" -ForegroundColor Green
+    Show-GateConflictWarnings -Gate $gate
   } else {
     $matched = @(Get-NetFirewallRule -ErrorAction SilentlyContinue |
       Where-Object { $_.Group -eq $group } |
@@ -298,6 +373,21 @@ function Manage-PortProxy {
       $dup = @($Cfg.PortProxies.$gate) | Where-Object { $_.ListenPort -eq $lp }
       if ($dup) { Write-Host "Entry for :$lp already exists." -ForegroundColor Yellow; continue }
 
+      # Cross-gate connect-side conflict: same ConnectAddress:ConnectPort already claimed
+      foreach ($g in @("docker","winapp")) {
+        $clash = @($Cfg.PortProxies.$g) | Where-Object {
+          $_.ConnectAddress -eq $ca -and $_.ConnectPort -eq $cp
+        }
+        if ($clash) {
+          Write-Host ("Conflict: {0}:{1} is already used by the {2} gate ({3}:{4} -> {5}:{6})." -f `
+            $ca, $cp, $g, (Get-GateIp $g), $clash[0].ListenPort, $clash[0].ConnectAddress, $clash[0].ConnectPort) `
+            -ForegroundColor Red
+          Write-Host "Two gates cannot forward to the same local address:port." -ForegroundColor Red
+          $ca = $null; break
+        }
+      }
+      if ($null -eq $ca) { continue }
+
       $entry = [PSCustomObject]@{ ListenPort = $lp; ConnectAddress = $ca; ConnectPort = $cp }
       $Cfg.PortProxies.$gate = @($Cfg.PortProxies.$gate) + $entry
       Save-Config $Cfg
@@ -308,6 +398,7 @@ function Manage-PortProxy {
           connectaddress=$ca connectport=$cp | Out-Null
       }
       Write-Host "Added: ${ip}:$lp -> ${ca}:$cp" -ForegroundColor Green
+      Show-GateConflictWarnings -Gate $gate
 
     } else {
       $lp = Read-Port "Listen port to remove on $ip"
@@ -450,6 +541,8 @@ function Show-AllRoutes {
         }
       }
     }
+
+    Show-GateConflictWarnings -Gate $g
   }
 
   Write-Host ""
